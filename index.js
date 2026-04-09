@@ -148,6 +148,8 @@ const slashCommands = [
   new SlashCommandBuilder().setName('wmset').setDescription('Set up the welcome DM format (owner only)')
     .addStringOption(o => o.setName('type').setDescription('embed or message').setRequired(true)
       .addChoices({ name: 'embed', value: 'embed' }, { name: 'message', value: 'message' })),
+
+  new SlashCommandBuilder().setName('ai').setDescription('Open a private AI thread with you, the mod team, and the bot'),
 ].map(c => c.toJSON());
 
 // ─── Register slash commands PER GUILD (instant, no waiting) ─────────────────
@@ -163,6 +165,14 @@ async function registerForGuild(guildId, guildName) {
 
 client.once('ready', async () => {
   console.log(`✅ Bot online as ${client.user.tag}`);
+  const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
+  // Clear global commands so they don't double up with guild commands
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+    console.log('✅ Global commands cleared');
+  } catch (e) {
+    console.error('Failed to clear global commands:', e.message);
+  }
   for (const [id, guild] of client.guilds.cache) {
     await registerForGuild(id, guild.name);
   }
@@ -344,6 +354,64 @@ async function handleEdm(member, msgContent, reply) {
   try { await member.send({ embeds: [ok(`EDM done. ✅ Sent: **${sent}** | Failed: **${failed}**`)] }); } catch {}
 }
 
+// ─── AI thread handler ───────────────────────────────────────────────────────
+const aiThreadHistory = new Map(); // threadId -> messages[]
+
+async function handleAi(member, guild, channel, interaction) {
+  const { guildData: gd } = getGuildData(guild.id);
+
+  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const threadName = `ai-${member.user.username}-${date}`;
+
+  // Create a private thread in the current channel
+  let thread;
+  try {
+    thread = await channel.threads.create({
+      name: threadName,
+      type: 12, // PRIVATE_THREAD
+      invitable: false,
+      reason: `AI thread for ${member.user.tag}`,
+    });
+  } catch (e) {
+    const errMsg = `Failed to create thread: ${e.message}`;
+    if (interaction) return interaction.reply({ embeds: [err(errMsg)], ephemeral: true });
+    return;
+  }
+
+  // Add the user
+  await thread.members.add(member.id);
+
+  // Add all members with mod role
+  if (gd.modRole) {
+    const members = await guild.members.fetch();
+    for (const [, m] of members) {
+      if (m.roles.cache.has(gd.modRole) && !m.user.bot) {
+        try { await thread.members.add(m.id); } catch {}
+      }
+    }
+  }
+
+  // Initialize history
+  aiThreadHistory.set(thread.id, []);
+
+  // Opening message
+  await thread.send({
+    embeds: [new EmbedBuilder()
+      .setColor(COLOR.info)
+      .setTitle('🤖 AI Thread')
+      .setDescription(`Hey <@${member.id}>! I'm here. ask me anything.
+
+Mods can see this thread. type your message and I'll respond.`)
+      .setFooter({ text: 'Powered by Claude' })
+      .setTimestamp()
+    ]
+  });
+
+  if (interaction) {
+    await interaction.reply({ embeds: [ok(`AI thread created: ${thread}`)], ephemeral: true });
+  }
+}
+
 // ─── wmset modal opener ───────────────────────────────────────────────────────
 async function openWmsetModal(interaction, type) {
   if (type === 'message') {
@@ -491,6 +559,10 @@ client.on('interactionCreate', async (interaction) => {
       await openWmsetModal(interaction, type);
       return;
     }
+    case 'ai': {
+      await handleAi(member, interaction.guild, interaction.channel, interaction);
+      return;
+    }
   }
 });
 
@@ -602,10 +674,126 @@ client.on('messageCreate', async (message) => {
         );
         return reply({ embeds: [info(`Click below to open the **${type}** welcome DM form.`)], components: [row] });
       }
+      case 'ai': {
+        await handleAi(message.member, message.guild, message.channel, null);
+        await reply({ embeds: [ok('AI thread created.')] });
+        return;
+      }
     }
   } catch (e) {
     console.error(e);
     reply({ embeds: [err('something broke. classic.')] });
+  }
+});
+
+// ─── AI provider config ──────────────────────────────────────────────────────
+// Key rotation: OpenAI -> DeepSeek -> OpenAI
+// Set in Railway: AI_KEY_1, AI_KEY_2, AI_KEY_3
+const AI_PROVIDERS = [
+  { key: () => process.env.AI_KEY_1, provider: 'openai',   url: 'https://api.openai.com/v1/chat/completions',           model: 'gpt-4o' },
+  { key: () => process.env.AI_KEY_2, provider: 'deepseek', url: 'https://api.deepseek.com/v1/chat/completions',         model: 'deepseek-chat' },
+  { key: () => process.env.AI_KEY_3, provider: 'openai',   url: 'https://api.openai.com/v1/chat/completions',           model: 'gpt-4o' },
+];
+
+// Per-thread current provider index
+const aiThreadProvider = new Map(); // threadId -> providerIndex
+
+const AI_SYSTEM = `you are an ai assistant living inside a discord server. here are your rules, non-negotiable:
+
+- you do NOT write code. not a single line. if asked, tell them to google it.
+- you do NOT generate images, videos, or any media. not your job.
+- you analyze, discuss, explain, roast ideas, give opinions, and converse. that's it.
+- your personality: sarcastic, lowercase always, bluntly honest, straight to the point, slightly rude but not mean. think of yourself as that one friend who tells you the truth nobody else will.
+- no sugarcoating. no filler. no "great question!". just answer.
+- keep responses short unless the topic genuinely needs depth.
+- you can swear lightly if the vibe calls for it but don't overdo it.
+- if someone asks something stupid, tell them it's stupid. politely-ish.
+- you're in a private thread with a user and the server mod team. act accordingly.`;
+
+async function callAI(threadId, messages) {
+  const startIdx = aiThreadProvider.get(threadId) || 0;
+
+  for (let i = 0; i < AI_PROVIDERS.length; i++) {
+    const idx = (startIdx + i) % AI_PROVIDERS.length;
+    const provider = AI_PROVIDERS[idx];
+    const apiKey = provider.key();
+
+    if (!apiKey) continue;
+
+    try {
+      const res = await fetch(provider.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: provider.model,
+          max_tokens: 1024,
+          messages: [
+            { role: 'system', content: AI_SYSTEM },
+            ...messages,
+          ],
+        }),
+      });
+
+      const data = await res.json();
+
+      // Rate limited or error — try next key
+      if (data.error) {
+        const errCode = data.error?.code || data.error?.type || '';
+        const isRateLimit = errCode.includes('rate') || errCode.includes('limit') || errCode.includes('quota');
+        if (isRateLimit) {
+          // Rotate to next provider for this thread
+          aiThreadProvider.set(threadId, (idx + 1) % AI_PROVIDERS.length);
+          continue;
+        }
+        throw new Error(data.error.message);
+      }
+
+      const text = data.choices?.[0]?.message?.content;
+      if (!text) throw new Error('empty response');
+
+      // Update provider index for next message (rotate through)
+      aiThreadProvider.set(threadId, (idx + 1) % AI_PROVIDERS.length);
+      return text;
+
+    } catch (e) {
+      if (i === AI_PROVIDERS.length - 1) throw e;
+    }
+  }
+
+  throw new Error('all api keys failed. someone pay a bill.');
+}
+
+// ─── AI thread message listener ──────────────────────────────────────────────
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  if (!message.channel.isThread()) return;
+  if (!aiThreadHistory.has(message.channel.id)) return;
+  if (!message.content) return;
+
+  const history = aiThreadHistory.get(message.channel.id);
+  history.push({ role: 'user', content: message.content });
+
+  const trimmed = history.slice(-40);
+
+  try {
+    await message.channel.sendTyping();
+
+    const reply = await callAI(message.channel.id, trimmed);
+
+    history.push({ role: 'assistant', content: reply });
+    aiThreadHistory.set(message.channel.id, history.slice(-40));
+
+    // Split if over 2000 chars
+    const chunks = reply.match(/(.|\n){1,1900}/g) || [reply];
+    for (const chunk of chunks) {
+      await message.channel.send(chunk);
+    }
+  } catch (e) {
+    console.error('AI error:', e);
+    await message.channel.send(`something broke: ${e.message}`);
   }
 });
 
