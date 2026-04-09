@@ -1,9 +1,10 @@
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder,
-  REST, Routes, SlashCommandBuilder, ApplicationCommandType,
-  PermissionsBitField, AttachmentBuilder
+  REST, Routes, SlashCommandBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  ModalBuilder, TextInputBuilder, TextInputStyle,
 } = require('discord.js');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 
 const client = new Client({
@@ -20,172 +21,155 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction, Partials.User],
 });
 
-const PREFIX = '+';
+const PREFIX    = '+';
 const DATA_FILE = path.join(__dirname, 'data.json');
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
-const COLOR = {
-  success: 0x57f287,
-  error:   0xed4245,
-  info:    0x5865f2,
-  warn:    0xfee75c,
-  watch:   0xff4444,
-};
+const COLOR = { success: 0x57f287, error: 0xed4245, info: 0x5865f2, warn: 0xfee75c, watch: 0xff4444 };
 
 // ─── Embed helpers ────────────────────────────────────────────────────────────
-function embed(color, title, description, fields = []) {
+function mkEmbed(color, title, description, fields) {
   const e = new EmbedBuilder().setColor(color).setDescription(description).setTimestamp();
   if (title) e.setTitle(title);
-  if (fields.length) e.addFields(fields);
+  if (fields && fields.length) e.addFields(fields);
   return e;
 }
-const ok   = (desc, fields) => embed(COLOR.success, null, `✅ ${desc}`, fields);
-const err  = (desc, fields) => embed(COLOR.error,   null, `❌ ${desc}`, fields);
-const info = (desc, fields) => embed(COLOR.info,    null, `ℹ️ ${desc}`, fields);
-const warn = (desc, fields) => embed(COLOR.warn,    null, `⚠️ ${desc}`, fields);
+const ok   = (d, f) => mkEmbed(COLOR.success, null, `✅ ${d}`, f);
+const err  = (d, f) => mkEmbed(COLOR.error,   null, `❌ ${d}`, f);
+const info = (d, f) => mkEmbed(COLOR.info,    null, `ℹ️ ${d}`, f);
 
 // ─── Data helpers ─────────────────────────────────────────────────────────────
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) return {};
   try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch { return {}; }
 }
-function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
+function saveData(d) { fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2)); }
+
 function getGuildData(guildId) {
   const data = loadData();
-  if (!data[guildId]) data[guildId] = { botRole: null, modRole: null, watchList: [], watchLogChannel: null };
+  if (!data[guildId]) data[guildId] = {
+    botRole: null, modRole: null, watchList: [],
+    watchLogChannel: null, modLogChannel: null, welcomeDm: false,
+    welcomeFormat: null, welcomeMsg: null, welcomeEmbed: null,
+  };
   return { data, guildData: data[guildId] };
 }
+
 function updateGuildData(guildId, updates) {
   const data = loadData();
-  if (!data[guildId]) data[guildId] = { botRole: null, modRole: null, watchList: [], watchLogChannel: null };
+  if (!data[guildId]) data[guildId] = {
+    botRole: null, modRole: null, watchList: [],
+    watchLogChannel: null, modLogChannel: null, welcomeDm: false,
+    welcomeFormat: null, welcomeMsg: null, welcomeEmbed: null,
+  };
   Object.assign(data[guildId], updates);
   saveData(data);
 }
 
 // ─── Permission helpers ───────────────────────────────────────────────────────
-function hasBotRole(member, guildData) {
-  if (!guildData.botRole) return false;
-  return member.roles.cache.has(guildData.botRole);
-}
-function hasModRole(member, guildData) {
-  if (!guildData.modRole) return false;
-  return member.roles.cache.has(guildData.modRole);
-}
-function isOwner(member) { return member.guild.ownerId === member.id; }
+function hasBotRole(member, gd) { return gd.botRole && member.roles.cache.has(gd.botRole); }
+function hasModRole(member, gd) { return gd.modRole && member.roles.cache.has(gd.modRole); }
+function isOwner(member)        { return member.guild.ownerId === member.id; }
 
 // ─── Watch log ────────────────────────────────────────────────────────────────
 async function logWatch(guild, userId, description) {
-  const { guildData } = getGuildData(guild.id);
-  if (!guildData.watchList?.includes(userId)) return;
-  if (!guildData.watchLogChannel) return;
-  const channel = guild.channels.cache.get(guildData.watchLogChannel);
-  if (!channel) return;
-  try {
-    await channel.send({ embeds: [embed(COLOR.watch, '👁️ Watch Log', description)] });
-  } catch {}
+  const { guildData: gd } = getGuildData(guild.id);
+  if (!gd.watchList?.includes(userId) || !gd.watchLogChannel) return;
+  const ch = guild.channels.cache.get(gd.watchLogChannel);
+  if (!ch) return;
+  try { await ch.send({ embeds: [mkEmbed(COLOR.watch, '👁️ Watch Log', description)] }); } catch {}
+}
+
+// ─── Mod log ──────────────────────────────────────────────────────────────────
+async function logMod(guild, description) {
+  const { guildData: gd } = getGuildData(guild.id);
+  if (!gd.modLogChannel) return;
+  const ch = guild.channels.cache.get(gd.modLogChannel);
+  if (!ch) return;
+  try { await ch.send({ embeds: [mkEmbed(COLOR.info, '🛡️ Mod Log', description)] }); } catch {}
 }
 
 // ─── Slash command definitions ────────────────────────────────────────────────
 const slashCommands = [
-  new SlashCommandBuilder()
-    .setName('ping')
-    .setDescription('Check if the bot is alive'),
+  new SlashCommandBuilder().setName('ping').setDescription('Check if the bot is alive'),
+  new SlashCommandBuilder().setName('help').setDescription('List all commands'),
 
-  new SlashCommandBuilder()
-    .setName('help')
-    .setDescription('List all commands'),
+  new SlashCommandBuilder().setName('changerole').setDescription('Set bot management role (owner only)')
+    .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('changerole')
-    .setDescription('Set the role that can change bot appearance (owner only)')
-    .addRoleOption(o => o.setName('role').setDescription('The role to set').setRequired(true)),
+  new SlashCommandBuilder().setName('modrole').setDescription('Set the mod role (owner only)')
+    .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('modrole')
-    .setDescription('Set the moderator role (owner only)')
-    .addRoleOption(o => o.setName('role').setDescription('The role to set').setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName('avatar')
-    .setDescription('Change the bot\'s avatar')
+  new SlashCommandBuilder().setName('avatar').setDescription("Change the bot's avatar")
     .addAttachmentOption(o => o.setName('image').setDescription('New avatar image').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('nickname')
-    .setDescription('Change the bot\'s nickname')
-    .addStringOption(o => o.setName('nickname').setDescription('The new nickname').setRequired(true)),
+  new SlashCommandBuilder().setName('nickname').setDescription("Change the bot's nickname")
+    .addStringOption(o => o.setName('nickname').setDescription('New nickname').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('ban')
-    .setDescription('Ban a member from the server')
+  new SlashCommandBuilder().setName('ban').setDescription('Ban a member')
     .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
-    .addStringOption(o => o.setName('reason').setDescription('Reason for ban').setRequired(false)),
+    .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)),
 
-  new SlashCommandBuilder()
-    .setName('kick')
-    .setDescription('Kick a member from the server')
+  new SlashCommandBuilder().setName('kick').setDescription('Kick a member')
     .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
-    .addStringOption(o => o.setName('reason').setDescription('Reason for kick').setRequired(false)),
+    .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)),
 
-  new SlashCommandBuilder()
-    .setName('timeout')
-    .setDescription('Timeout a member')
+  new SlashCommandBuilder().setName('timeout').setDescription('Timeout a member')
     .addUserOption(o => o.setName('user').setDescription('User to timeout').setRequired(true))
-    .addIntegerOption(o => o.setName('minutes').setDescription('Duration in minutes (default: 10)').setRequired(false).setMinValue(1).setMaxValue(40320)),
+    .addIntegerOption(o => o.setName('minutes').setDescription('Duration in minutes (default 10)').setRequired(false).setMinValue(1).setMaxValue(40320)),
 
-  new SlashCommandBuilder()
-    .setName('watch')
-    .setDescription('Toggle watch on a member (logs all their activity)')
+  new SlashCommandBuilder().setName('watch').setDescription('Toggle watch on a member')
     .addUserOption(o => o.setName('user').setDescription('User to watch/unwatch').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('watchlog')
-    .setDescription('Set the channel for watch logs')
-    .addChannelOption(o => o.setName('channel').setDescription('Channel to send logs to').setRequired(false)),
+  new SlashCommandBuilder().setName('watchlog').setDescription('Set watch log channel')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(false)),
 
-  new SlashCommandBuilder()
-    .setName('send')
-    .setDescription('Send a message as the bot to a channel')
+  new SlashCommandBuilder().setName('send').setDescription('Send a message as the bot')
     .addChannelOption(o => o.setName('channel').setDescription('Target channel').setRequired(true))
     .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('giverole')
-    .setDescription('Give a role to a user')
-    .addUserOption(o => o.setName('user').setDescription('User to give the role to').setRequired(true))
+  new SlashCommandBuilder().setName('giverole').setDescription('Give a role to a user')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
     .addRoleOption(o => o.setName('role').setDescription('Role to give').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('slog')
-    .setDescription('Set the channel for mod command logs (owner only)')
+  new SlashCommandBuilder().setName('slog').setDescription('Set mod command log channel (owner only)')
     .addChannelOption(o => o.setName('channel').setDescription('Log channel').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('swatch')
-    .setDescription('Set the channel for watch list logs (owner only)')
+  new SlashCommandBuilder().setName('swatch').setDescription('Set watch list log channel (owner only)')
     .addChannelOption(o => o.setName('channel').setDescription('Watch log channel').setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName('wdm')
-    .setDescription('Toggle welcome DMs on or off (owner only)')
-    .addStringOption(o => o.setName('toggle').setDescription('on or off').setRequired(true).addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' })),
+  new SlashCommandBuilder().setName('wdm').setDescription('Toggle welcome DMs (owner only)')
+    .addStringOption(o => o.setName('toggle').setDescription('on or off').setRequired(true)
+      .addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' })),
 
-  new SlashCommandBuilder()
-    .setName('edm')
-    .setDescription('DM every member in the server with a message (owner only)')
+  new SlashCommandBuilder().setName('edm').setDescription('DM every member in the server (owner only)')
     .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true)),
-].map(cmd => cmd.toJSON());
 
-// ─── Register slash commands ──────────────────────────────────────────────────
-client.once('ready', async () => {
-  console.log(`✅ Bot online as ${client.user.tag}`);
+  new SlashCommandBuilder().setName('wmset').setDescription('Set up the welcome DM format (owner only)')
+    .addStringOption(o => o.setName('type').setDescription('embed or message').setRequired(true)
+      .addChoices({ name: 'embed', value: 'embed' }, { name: 'message', value: 'message' })),
+].map(c => c.toJSON());
+
+// ─── Register slash commands PER GUILD (instant, no waiting) ─────────────────
+async function registerForGuild(guildId, guildName) {
   const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
   try {
-    await rest.put(Routes.applicationCommands(client.user.id), { body: slashCommands });
-    console.log('✅ Slash commands registered globally');
+    await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: slashCommands });
+    console.log(`✅ Slash commands registered for: ${guildName}`);
   } catch (e) {
-    console.error('Failed to register slash commands:', e);
+    console.error(`Failed for guild ${guildName}:`, e.message);
   }
+}
+
+client.once('ready', async () => {
+  console.log(`✅ Bot online as ${client.user.tag}`);
+  for (const [id, guild] of client.guilds.cache) {
+    await registerForGuild(id, guild.name);
+  }
+});
+
+client.on('guildCreate', async (guild) => {
+  await registerForGuild(guild.id, guild.name);
 });
 
 // ─── Help embed ───────────────────────────────────────────────────────────────
@@ -195,47 +179,36 @@ function buildHelpEmbed() {
     .setTitle('📖 Command List')
     .setDescription('Prefix: `+` | All commands also available as `/`')
     .addFields(
-      {
-        name: '⚙️ Owner Only',
-        value: [
-          '`+changerole @role` — Set the bot management role',
-          '`+modrole @role` — Set the mod role',
-          '`+slog #channel` — Set mod command log channel',
-          '`+swatch #channel` — Set watch list log channel',
-          '`+wdm on/off` — Toggle welcome DMs',
-          '`+edm <message>` — DM every member in the server',
-        ].join('\n'),
-      },
-      {
-        name: '🎨 Bot Management (Bot Role)',
-        value: [
-          '`+avatar` + attachment — Change bot avatar',
-          '`+nickname <name>` — Change bot nickname',
-        ].join('\n'),
-      },
-      {
-        name: '🔨 Moderation (Mod Role)',
-        value: [
-          '`+ban @user [reason]` — Ban a member',
-          '`+kick @user [reason]` — Kick a member',
-          '`+timeout @user [minutes]` — Timeout a member (default: 10m)',
-          '`+watch @user` — Toggle watch on a member',
-          '`+watchlog [#channel]` — Set watch log channel',
-          '`+send #channel <message>` — Send a message as the bot',
-          '`+giverole @user @role` — Give a role to a user',
-        ].join('\n'),
-      },
-      {
-        name: '🌐 General',
-        value: '`+ping` — Check if bot is alive',
-      }
+      { name: '⚙️ Owner Only', value: [
+        '`+changerole @role` — Set bot management role',
+        '`+modrole @role` — Set mod role',
+        '`+slog #channel` — Set mod log channel',
+        '`+swatch #channel` — Set watch log channel',
+        '`+wdm on/off` — Toggle welcome DMs',
+        '`+wmset embed/message` — Set welcome DM format',
+        '`+edm <message>` — DM every member',
+      ].join('\n') },
+      { name: '🎨 Bot Management (Bot Role)', value: [
+        '`+avatar` + attachment — Change bot avatar',
+        '`+nickname <n>` — Change bot nickname',
+      ].join('\n') },
+      { name: '🔨 Moderation (Mod Role)', value: [
+        '`+ban @user [reason]` — Ban a member',
+        '`+kick @user [reason]` — Kick a member',
+        '`+timeout @user [minutes]` — Timeout (default 10m)',
+        '`+watch @user` — Toggle watch on a member',
+        '`+watchlog [#channel]` — Set watch log channel',
+        '`+send #channel <message>` — Send message as bot',
+        '`+giverole @user @role` — Give a role to a user',
+      ].join('\n') },
+      { name: '🌐 General', value: '`+ping` — Check if bot is alive' }
     )
     .setTimestamp();
 }
 
-// ─── Shared logic ─────────────────────────────────────────────────────────────
+// ─── Shared handlers ──────────────────────────────────────────────────────────
 async function handlePing(reply) {
-  await reply({ embeds: [embed(COLOR.success, null, "yeah yeah yeah - I'm alive. I guess.")] });
+  await reply({ embeds: [ok("yeah yeah yeah - I'm alive. I guess.")] });
 }
 
 async function handleHelp(reply) {
@@ -254,216 +227,255 @@ async function handleModrole(member, role, reply) {
   await reply({ embeds: [ok(`Mod role set to **${role.name}**. try not to abuse it.`)] });
 }
 
-async function handleAvatar(member, guildData, imageUrl, reply) {
-  if (!hasBotRole(member, guildData)) return reply({ embeds: [err("you don't have the role for that. tough luck.")], ephemeral: true });
+async function handleAvatar(member, gd, imageUrl, reply) {
+  if (!hasBotRole(member, gd)) return reply({ embeds: [err("you don't have the role for that.")], ephemeral: true });
   try {
     await client.user.setAvatar(imageUrl);
     await reply({ embeds: [ok('Avatar updated. stunning.')] });
-  } catch (e) {
-    await reply({ embeds: [err(`Failed: ${e.message}`)] });
-  }
+  } catch (e) { await reply({ embeds: [err(`Failed: ${e.message}`)] }); }
 }
 
-async function handleNickname(member, guildData, nick, reply) {
-  if (!hasBotRole(member, guildData)) return reply({ embeds: [err('no role, no nickname change. simple math.')], ephemeral: true });
+async function handleNickname(member, gd, nick, reply) {
+  if (!hasBotRole(member, gd)) return reply({ embeds: [err('no role, no nickname change.')], ephemeral: true });
   try {
     await member.guild.members.me.setNickname(nick);
-    await reply({ embeds: [ok(`Nickname changed to **${nick}**. creative choice.`)] });
-  } catch (e) {
-    await reply({ embeds: [err(`Failed: ${e.message}`)] });
-  }
+    await reply({ embeds: [ok(`Nickname changed to **${nick}**.`)] });
+  } catch (e) { await reply({ embeds: [err(`Failed: ${e.message}`)] }); }
 }
 
-async function handleBan(member, guildData, target, reason, reply) {
-  if (!hasModRole(member, guildData)) return reply({ embeds: [err('not a mod. next.')], ephemeral: true });
+async function handleBan(member, gd, target, reason, reply) {
+  if (!hasModRole(member, gd)) return reply({ embeds: [err('not a mod. next.')], ephemeral: true });
   if (!target.bannable) return reply({ embeds: [err("can't ban that person. they outrank me.")], ephemeral: true });
+  const r = reason || 'No reason provided';
   try {
-    await target.ban({ reason: reason || 'No reason provided' });
-    await reply({ embeds: [ok(`**${target.user.tag}** has been banned. bye bye. 👋`, [{ name: 'Reason', value: reason || 'No reason provided' }])] });
-  } catch (e) {
-    await reply({ embeds: [err(`Ban failed: ${e.message}`)] });
-  }
+    await target.ban({ reason: r });
+    await logMod(member.guild, `🔨 **${member.user.tag}** banned **${target.user.tag}**\nReason: ${r}`);
+    await reply({ embeds: [ok(`**${target.user.tag}** has been banned. bye bye. 👋`, [{ name: 'Reason', value: r }])] });
+  } catch (e) { await reply({ embeds: [err(`Ban failed: ${e.message}`)] }); }
 }
 
-async function handleKick(member, guildData, target, reason, reply) {
-  if (!hasModRole(member, guildData)) return reply({ embeds: [err('not a mod. sit.')], ephemeral: true });
+async function handleKick(member, gd, target, reason, reply) {
+  if (!hasModRole(member, gd)) return reply({ embeds: [err('not a mod. sit.')], ephemeral: true });
   if (!target.kickable) return reply({ embeds: [err("can't kick that person.")], ephemeral: true });
+  const r = reason || 'No reason provided';
   try {
-    await target.kick(reason || 'No reason provided');
-    await reply({ embeds: [ok(`**${target.user.tag}** has been kicked. see ya. 🚪`, [{ name: 'Reason', value: reason || 'No reason provided' }])] });
-  } catch (e) {
-    await reply({ embeds: [err(`Kick failed: ${e.message}`)] });
-  }
+    await target.kick(r);
+    await logMod(member.guild, `🚪 **${member.user.tag}** kicked **${target.user.tag}**\nReason: ${r}`);
+    await reply({ embeds: [ok(`**${target.user.tag}** has been kicked. see ya. 🚪`, [{ name: 'Reason', value: r }])] });
+  } catch (e) { await reply({ embeds: [err(`Kick failed: ${e.message}`)] }); }
 }
 
-async function handleTimeout(member, guildData, target, minutes, reply) {
-  if (!hasModRole(member, guildData)) return reply({ embeds: [err('not a mod. no.')], ephemeral: true });
-  const duration = minutes || 10;
+async function handleTimeout(member, gd, target, minutes, reply) {
+  if (!hasModRole(member, gd)) return reply({ embeds: [err('not a mod. no.')], ephemeral: true });
+  const dur = minutes || 10;
   try {
-    await target.timeout(duration * 60 * 1000, `Timed out by ${member.user.tag}`);
-    await reply({ embeds: [ok(`**${target.user.tag}** is in timeout for **${duration}** minute(s). think about what you did. 🔇`)] });
-  } catch (e) {
-    await reply({ embeds: [err(`Timeout failed: ${e.message}`)] });
-  }
+    await target.timeout(dur * 60 * 1000, `Timed out by ${member.user.tag}`);
+    await logMod(member.guild, `🔇 **${member.user.tag}** timed out **${target.user.tag}** for **${dur}m**`);
+    await reply({ embeds: [ok(`**${target.user.tag}** is in timeout for **${dur}** minute(s). think about what you did. 🔇`)] });
+  } catch (e) { await reply({ embeds: [err(`Timeout failed: ${e.message}`)] }); }
 }
 
-async function handleWatch(member, guildData, target, channelId, reply) {
-  if (!hasModRole(member, guildData)) return reply({ embeds: [err('mods only.')], ephemeral: true });
-  const currentList = guildData.watchList || [];
-  const isWatched = currentList.includes(target.id);
-  if (isWatched) {
-    updateGuildData(member.guild.id, { watchList: currentList.filter(id => id !== target.id) });
+async function handleWatch(member, gd, target, channelId, reply) {
+  if (!hasModRole(member, gd)) return reply({ embeds: [err('mods only.')], ephemeral: true });
+  const list = gd.watchList || [];
+  if (list.includes(target.id)) {
+    updateGuildData(member.guild.id, { watchList: list.filter(id => id !== target.id) });
     await reply({ embeds: [ok(`**${target.user.tag}** removed from watch list. they can breathe now.`)] });
   } else {
-    updateGuildData(member.guild.id, {
-      watchList: [...currentList, target.id],
-      watchLogChannel: guildData.watchLogChannel || channelId,
-    });
+    updateGuildData(member.guild.id, { watchList: [...list, target.id], watchLogChannel: gd.watchLogChannel || channelId });
     await reply({ embeds: [ok(`**${target.user.tag}** is now being watched. 👁️`)] });
   }
 }
 
-async function handleWatchlog(member, guildData, channel, currentChannelId, reply) {
-  if (!hasModRole(member, guildData)) return reply({ embeds: [err('mods only.')], ephemeral: true });
-  const targetId = channel?.id || currentChannelId;
-  updateGuildData(member.guild.id, { watchLogChannel: targetId });
-  await reply({ embeds: [ok(`Watch logs will go to <#${targetId}>. enjoy the surveillance.`)] });
+async function handleWatchlog(member, gd, channel, currentChannelId, reply) {
+  if (!hasModRole(member, gd)) return reply({ embeds: [err('mods only.')], ephemeral: true });
+  const id = channel?.id || currentChannelId;
+  updateGuildData(member.guild.id, { watchLogChannel: id });
+  await reply({ embeds: [ok(`Watch logs → <#${id}>.`)] });
 }
 
-async function handleSend(member, guildData, targetChannel, msgContent, reply) {
-  if (!hasModRole(member, guildData)) return reply({ embeds: [err('mods only.')], ephemeral: true });
+async function handleSend(member, gd, targetChannel, msgContent, reply) {
+  if (!hasModRole(member, gd)) return reply({ embeds: [err('mods only.')], ephemeral: true });
   if (!msgContent) return reply({ embeds: [err('give me something to say.')], ephemeral: true });
   try {
     await targetChannel.send(msgContent);
-    await reply({ embeds: [ok(`Message sent to <#${targetChannel.id}>. ✅`)], ephemeral: true });
-  } catch (e) {
-    await reply({ embeds: [err(`Couldn't send: ${e.message}`)] });
-  }
+    await reply({ embeds: [ok(`Sent to <#${targetChannel.id}>. ✅`)], ephemeral: true });
+  } catch (e) { await reply({ embeds: [err(`Couldn't send: ${e.message}`)] }); }
 }
 
-async function handleGiverole(member, guildData, target, role, reply) {
-  if (!hasModRole(member, guildData)) return reply({ embeds: [err('mods only.')], ephemeral: true });
+async function handleGiverole(member, gd, target, role, reply) {
+  if (!hasModRole(member, gd)) return reply({ embeds: [err('mods only.')], ephemeral: true });
   try {
     await target.roles.add(role);
-    await reply({ embeds: [ok(`Gave **${role.name}** to **${target.user.tag}**. enjoy your new rank.`)] });
-  } catch (e) {
-    await reply({ embeds: [err(`Failed: ${e.message}`)] });
-  }
+    await logMod(member.guild, `🎭 **${member.user.tag}** gave **${role.name}** to **${target.user.tag}**`);
+    await reply({ embeds: [ok(`Gave **${role.name}** to **${target.user.tag}**.`)] });
+  } catch (e) { await reply({ embeds: [err(`Failed: ${e.message}`)] }); }
 }
 
 async function handleSlog(member, channel, reply) {
   if (!isOwner(member)) return reply({ embeds: [err('owners only.')], ephemeral: true });
   updateGuildData(member.guild.id, { modLogChannel: channel.id });
-  await reply({ embeds: [ok(`Mod command logs will go to <#${channel.id}>.`)] });
+  await reply({ embeds: [ok(`Mod logs → <#${channel.id}>.`)] });
 }
 
 async function handleSwatch(member, channel, reply) {
   if (!isOwner(member)) return reply({ embeds: [err('owners only.')], ephemeral: true });
   updateGuildData(member.guild.id, { watchLogChannel: channel.id });
-  await reply({ embeds: [ok(`Watch list logs will go to <#${channel.id}>. eyes open.`)] });
+  await reply({ embeds: [ok(`Watch logs → <#${channel.id}>.`)] });
 }
 
 async function handleWdm(member, toggle, reply) {
   if (!isOwner(member)) return reply({ embeds: [err('owners only.')], ephemeral: true });
-  const on = toggle === 'on';
-  updateGuildData(member.guild.id, { welcomeDm: on });
-  await reply({ embeds: [ok(`Welcome DMs are now **${on ? 'enabled' : 'disabled'}**.`)] });
+  updateGuildData(member.guild.id, { welcomeDm: toggle === 'on' });
+  await reply({ embeds: [ok(`Welcome DMs are now **${toggle === 'on' ? 'enabled' : 'disabled'}**.`)] });
 }
 
 async function handleEdm(member, msgContent, reply) {
   if (!isOwner(member)) return reply({ embeds: [err('owners only.')], ephemeral: true });
   if (!msgContent) return reply({ embeds: [err('give me a message.')], ephemeral: true });
-  await reply({ embeds: [info('Sending DMs... this might take a while.')] });
+  await reply({ embeds: [info("Sending DMs... I'll DM you when done.")] });
   const members = await member.guild.members.fetch();
   let sent = 0, failed = 0;
   for (const [, m] of members) {
     if (m.user.bot) continue;
     try { await m.send(msgContent); sent++; } catch { failed++; }
-    await new Promise(r => setTimeout(r, 500)); // rate limit buffer
+    await new Promise(r => setTimeout(r, 500));
   }
-  try {
-    await member.send({ embeds: [ok(`EDM done. ✅ Sent: **${sent}** | Failed: **${failed}**`)] });
-  } catch {}
+  try { await member.send({ embeds: [ok(`EDM done. ✅ Sent: **${sent}** | Failed: **${failed}**`)] }); } catch {}
 }
 
-// ─── Slash command handler ────────────────────────────────────────────────────
+// ─── wmset modal opener ───────────────────────────────────────────────────────
+async function openWmsetModal(interaction, type) {
+  if (type === 'message') {
+    const modal = new ModalBuilder().setCustomId('wmset_message').setTitle('Welcome DM — Message Format');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('wm_title').setLabel('Title (optional)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('e.g. Welcome!')
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('wm_body').setLabel('Body (required) — use {user} and {server}').setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder('Welcome to {server}, {user}!')
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('wm_timestamp').setLabel('Include "sent on {date}"? (y/n)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('y or n').setMaxLength(1)
+      ),
+    );
+    await interaction.showModal(modal);
+  } else {
+    const modal = new ModalBuilder().setCustomId('wmset_embed').setTitle('Welcome DM — Embed Format');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('em_title').setLabel('Title (optional) — use {user}, {server}').setStyle(TextInputStyle.Short).setRequired(false)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('em_author').setLabel('Author (optional)').setStyle(TextInputStyle.Short).setRequired(false)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('em_body').setLabel('Body (optional) — use {user}, {server}').setStyle(TextInputStyle.Paragraph).setRequired(false)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('em_color').setLabel('Color hex (optional, e.g. #ff3c3c)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(7)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('em_footer').setLabel('Footer (optional)').setStyle(TextInputStyle.Short).setRequired(false)
+      ),
+    );
+    await interaction.showModal(modal);
+  }
+}
+
+// ─── Interaction handler ──────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
+
+  // Modal submits
+  if (interaction.isModalSubmit()) {
+    const guildId = interaction.guild.id;
+
+    if (interaction.customId === 'wmset_message') {
+      const title     = interaction.fields.getTextInputValue('wm_title');
+      const body      = interaction.fields.getTextInputValue('wm_body');
+      const timestamp = interaction.fields.getTextInputValue('wm_timestamp').toLowerCase() === 'y';
+      updateGuildData(guildId, { welcomeFormat: 'message', welcomeMsg: { title, body, timestamp } });
+      await interaction.reply({ embeds: [ok('Welcome DM message format saved. ✅')], ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId === 'wmset_embed') {
+      const title  = interaction.fields.getTextInputValue('em_title');
+      const author = interaction.fields.getTextInputValue('em_author');
+      const body   = interaction.fields.getTextInputValue('em_body');
+      const color  = interaction.fields.getTextInputValue('em_color');
+      const footer = interaction.fields.getTextInputValue('em_footer');
+      updateGuildData(guildId, { welcomeFormat: 'embed', welcomeEmbed: { title, author, body, color, footer } });
+      await interaction.reply({ embeds: [ok('Welcome DM embed format saved. ✅')], ephemeral: true });
+      return;
+    }
+  }
+
+  // Button presses (from +wmset prefix command)
+  if (interaction.isButton()) {
+    if (!interaction.customId.startsWith('wmset_open_')) return;
+    if (!isOwner(interaction.member)) {
+      await interaction.reply({ embeds: [err('owners only.')], ephemeral: true });
+      return;
+    }
+    const type = interaction.customId.replace('wmset_open_', '');
+    await openWmsetModal(interaction, type);
+    return;
+  }
+
+  // Slash commands
   if (!interaction.isChatInputCommand()) return;
-  const { guildData } = getGuildData(interaction.guild.id);
-  const reply = (opts) => interaction.reply(opts);
+  const { guildData: gd } = getGuildData(interaction.guild.id);
+  const reply  = (opts) => interaction.reply(opts);
   const member = interaction.member;
 
   switch (interaction.commandName) {
-    case 'ping': return handlePing(reply);
-    case 'help': return handleHelp(reply);
+    case 'ping':       return handlePing(reply);
+    case 'help':       return handleHelp(reply);
     case 'changerole': return handleChangerole(member, interaction.options.getRole('role'), reply);
-    case 'modrole': return handleModrole(member, interaction.options.getRole('role'), reply);
-    case 'avatar': {
-      const attachment = interaction.options.getAttachment('image');
-      return handleAvatar(member, guildData, attachment.url, reply);
+    case 'modrole':    return handleModrole(member, interaction.options.getRole('role'), reply);
+    case 'avatar':     return handleAvatar(member, gd, interaction.options.getAttachment('image').url, reply);
+    case 'nickname':   return handleNickname(member, gd, interaction.options.getString('nickname'), reply);
+    case 'ban':        return handleBan(member, gd, interaction.options.getMember('user'), interaction.options.getString('reason'), reply);
+    case 'kick':       return handleKick(member, gd, interaction.options.getMember('user'), interaction.options.getString('reason'), reply);
+    case 'timeout':    return handleTimeout(member, gd, interaction.options.getMember('user'), interaction.options.getInteger('minutes'), reply);
+    case 'watch':      return handleWatch(member, gd, interaction.options.getMember('user'), interaction.channelId, reply);
+    case 'watchlog':   return handleWatchlog(member, gd, interaction.options.getChannel('channel'), interaction.channelId, reply);
+    case 'send':       return handleSend(member, gd, interaction.options.getChannel('channel'), interaction.options.getString('message'), reply);
+    case 'giverole':   return handleGiverole(member, gd, interaction.options.getMember('user'), interaction.options.getRole('role'), reply);
+    case 'slog':       return handleSlog(member, interaction.options.getChannel('channel'), reply);
+    case 'swatch':     return handleSwatch(member, interaction.options.getChannel('channel'), reply);
+    case 'wdm':        return handleWdm(member, interaction.options.getString('toggle'), reply);
+    case 'edm':        return handleEdm(member, interaction.options.getString('message'), reply);
+    case 'wmset': {
+      if (!isOwner(member)) return reply({ embeds: [err('owners only.')], ephemeral: true });
+      const type = interaction.options.getString('type');
+      await openWmsetModal(interaction, type);
+      return;
     }
-    case 'nickname': return handleNickname(member, guildData, interaction.options.getString('nickname'), reply);
-    case 'ban': {
-      const target = interaction.options.getMember('user');
-      return handleBan(member, guildData, target, interaction.options.getString('reason'), reply);
-    }
-    case 'kick': {
-      const target = interaction.options.getMember('user');
-      return handleKick(member, guildData, target, interaction.options.getString('reason'), reply);
-    }
-    case 'timeout': {
-      const target = interaction.options.getMember('user');
-      return handleTimeout(member, guildData, target, interaction.options.getInteger('minutes'), reply);
-    }
-    case 'watch': {
-      const target = interaction.options.getMember('user');
-      return handleWatch(member, guildData, target, interaction.channelId, reply);
-    }
-    case 'watchlog': {
-      const channel = interaction.options.getChannel('channel');
-      return handleWatchlog(member, guildData, channel, interaction.channelId, reply);
-    }
-    case 'send': {
-      const channel = interaction.options.getChannel('channel');
-      const msg = interaction.options.getString('message');
-      return handleSend(member, guildData, channel, msg, reply);
-    }
-    case 'giverole': {
-      const target = interaction.options.getMember('user');
-      const role = interaction.options.getRole('role');
-      return handleGiverole(member, guildData, target, role, reply);
-    }
-    case 'slog': return handleSlog(member, interaction.options.getChannel('channel'), reply);
-    case 'swatch': return handleSwatch(member, interaction.options.getChannel('channel'), reply);
-    case 'wdm': return handleWdm(member, interaction.options.getString('toggle'), reply);
-    case 'edm': return handleEdm(member, interaction.options.getString('message'), reply);
   }
 });
 
 // ─── Prefix command handler ───────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
+  const { guildData: gd } = getGuildData(message.guild.id);
 
-  const { guildData } = getGuildData(message.guild.id);
-
-  // Watch logging
-  if (guildData.watchList?.includes(message.author.id)) {
+  if (gd.watchList?.includes(message.author.id)) {
     await logWatch(message.guild, message.author.id,
       `📨 **Message** from <@${message.author.id}> in <#${message.channel.id}>:\n${message.content || '*[no text content]*'}`
     );
   }
 
   if (!message.content.startsWith(PREFIX)) return;
-
-  const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+  const args    = message.content.slice(PREFIX.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
-  const reply = (opts) => message.reply(opts);
+  const reply   = (opts) => message.reply(opts);
 
   try {
     switch (command) {
       case 'ping': return handlePing(reply);
       case 'help': return handleHelp(reply);
-
       case 'changerole': {
         const role = message.mentions.roles.first();
         if (!role) return reply({ embeds: [err('mention a role. like `+changerole @role`')] });
@@ -475,73 +487,80 @@ client.on('messageCreate', async (message) => {
         return handleModrole(message.member, role, reply);
       }
       case 'avatar': {
-        const attachment = message.attachments.first();
-        if (!attachment) return reply({ embeds: [err('attach an image, rocket scientist.')] });
-        return handleAvatar(message.member, guildData, attachment.url, reply);
+        const att = message.attachments.first();
+        if (!att) return reply({ embeds: [err('attach an image.')] });
+        return handleAvatar(message.member, gd, att.url, reply);
       }
       case 'nickname': {
         const nick = args.join(' ');
-        if (!nick) return reply({ embeds: [err('give me a name at least.')] });
-        return handleNickname(message.member, guildData, nick, reply);
+        if (!nick) return reply({ embeds: [err('give me a name.')] });
+        return handleNickname(message.member, gd, nick, reply);
       }
       case 'ban': {
         const target = message.mentions.members.first();
         if (!target) return reply({ embeds: [err('mention someone to ban.')] });
-        const reason = args.slice(1).join(' ');
-        return handleBan(message.member, guildData, target, reason, reply);
+        return handleBan(message.member, gd, target, args.slice(1).join(' '), reply);
       }
       case 'kick': {
         const target = message.mentions.members.first();
         if (!target) return reply({ embeds: [err('mention someone to kick.')] });
-        const reason = args.slice(1).join(' ');
-        return handleKick(message.member, guildData, target, reason, reply);
+        return handleKick(message.member, gd, target, args.slice(1).join(' '), reply);
       }
       case 'timeout': {
         const target = message.mentions.members.first();
         if (!target) return reply({ embeds: [err('mention someone to timeout.')] });
-        const minutes = parseInt(args[1]) || 10;
-        return handleTimeout(message.member, guildData, target, minutes, reply);
+        return handleTimeout(message.member, gd, target, parseInt(args[1]) || 10, reply);
       }
       case 'watch': {
         const target = message.mentions.members.first();
         if (!target) return reply({ embeds: [err('mention someone to watch.')] });
-        return handleWatch(message.member, guildData, target, message.channel.id, reply);
+        return handleWatch(message.member, gd, target, message.channel.id, reply);
       }
       case 'watchlog': {
-        const channel = message.mentions.channels.first();
-        return handleWatchlog(message.member, guildData, channel, message.channel.id, reply);
+        return handleWatchlog(message.member, gd, message.mentions.channels.first(), message.channel.id, reply);
       }
       case 'send': {
-        const targetChannel = message.mentions.channels.first();
-        if (!targetChannel) return reply({ embeds: [err('mention a channel first. like `+send #channel your message`')] });
-        const msgContent = message.content.slice(PREFIX.length + 'send'.length).replace(/<#\d+>/g, '').trim();
-        return handleSend(message.member, guildData, targetChannel, msgContent, reply);
+        const ch = message.mentions.channels.first();
+        if (!ch) return reply({ embeds: [err('mention a channel. like `+send #channel message`')] });
+        const msg = message.content.slice(PREFIX.length + 'send'.length).replace(/<#\d+>/g, '').trim();
+        return handleSend(message.member, gd, ch, msg, reply);
       }
       case 'giverole': {
         const target = message.mentions.members.first();
+        const role   = message.mentions.roles.first();
         if (!target) return reply({ embeds: [err('mention a user. like `+giverole @user @role`')] });
-        const role = message.mentions.roles.first();
-        if (!role) return reply({ embeds: [err('mention a role. like `+giverole @user @role`')] });
-        return handleGiverole(message.member, guildData, target, role, reply);
+        if (!role)   return reply({ embeds: [err('mention a role. like `+giverole @user @role`')] });
+        return handleGiverole(message.member, gd, target, role, reply);
       }
       case 'slog': {
-        const channel = message.mentions.channels.first();
-        if (!channel) return reply({ embeds: [err('mention a channel. like `+slog #channel`')] });
-        return handleSlog(message.member, channel, reply);
+        const ch = message.mentions.channels.first();
+        if (!ch) return reply({ embeds: [err('mention a channel. like `+slog #channel`')] });
+        return handleSlog(message.member, ch, reply);
       }
       case 'swatch': {
-        const channel = message.mentions.channels.first();
-        if (!channel) return reply({ embeds: [err('mention a channel. like `+swatch #channel`')] });
-        return handleSwatch(message.member, channel, reply);
+        const ch = message.mentions.channels.first();
+        if (!ch) return reply({ embeds: [err('mention a channel. like `+swatch #channel`')] });
+        return handleSwatch(message.member, ch, reply);
       }
       case 'wdm': {
         const toggle = args[0]?.toLowerCase();
-        if (!toggle || !['on', 'off'].includes(toggle)) return reply({ embeds: [err('use `+wdm on` or `+wdm off`')] });
+        if (!['on', 'off'].includes(toggle)) return reply({ embeds: [err('use `+wdm on` or `+wdm off`')] });
         return handleWdm(message.member, toggle, reply);
       }
       case 'edm': {
-        const msgContent = args.join(' ');
-        return handleEdm(message.member, msgContent, reply);
+        return handleEdm(message.member, args.join(' '), reply);
+      }
+      case 'wmset': {
+        if (!isOwner(message.member)) return reply({ embeds: [err('owners only.')] });
+        const type = args[0]?.toLowerCase();
+        if (!['embed', 'message'].includes(type)) return reply({ embeds: [err('use `+wmset embed` or `+wmset message`')] });
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`wmset_open_${type}`)
+            .setLabel(`Open ${type} form`)
+            .setStyle(ButtonStyle.Primary)
+        );
+        return reply({ embeds: [info(`Click below to open the **${type}** welcome DM form.`)], components: [row] });
       }
     }
   } catch (e) {
@@ -564,9 +583,7 @@ client.on('userUpdate', async (oldUser, newUser) => {
     for (const [, guild] of client.guilds.cache) {
       const member = guild.members.cache.get(newUser.id);
       if (!member) continue;
-      await logWatch(guild, newUser.id,
-        `🖼️ **Avatar changed** for <@${newUser.id}>\nNew avatar: ${newUser.displayAvatarURL()}`
-      );
+      await logWatch(guild, newUser.id, `🖼️ **Avatar changed** for <@${newUser.id}>\n${newUser.displayAvatarURL()}`);
     }
   }
 });
@@ -574,14 +591,14 @@ client.on('userUpdate', async (oldUser, newUser) => {
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot || !reaction.message.guild) return;
   await logWatch(reaction.message.guild, user.id,
-    `👍 **Reaction added** by <@${user.id}> in <#${reaction.message.channel.id}>: ${reaction.emoji.toString()}`
+    `👍 **Reaction** by <@${user.id}> in <#${reaction.message.channel.id}>: ${reaction.emoji.toString()}`
   );
 });
 
 client.on('messageDelete', async (message) => {
   if (!message.guild || message.author?.bot) return;
   await logWatch(message.guild, message.author?.id,
-    `🗑️ **Message deleted** from <@${message.author?.id}> in <#${message.channel.id}>:\n${message.content || '*[unknown content]*'}`
+    `🗑️ **Deleted** from <@${message.author?.id}> in <#${message.channel.id}>:\n${message.content || '*unknown*'}`
   );
 });
 
@@ -589,34 +606,61 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
   if (!newMessage.guild || newMessage.author?.bot) return;
   if (oldMessage.content === newMessage.content) return;
   await logWatch(newMessage.guild, newMessage.author?.id,
-    `✏️ **Message edited** by <@${newMessage.author?.id}> in <#${newMessage.channel.id}>:\n**Before:** ${oldMessage.content || '*unknown*'}\n**After:** ${newMessage.content}`
+    `✏️ **Edited** by <@${newMessage.author?.id}> in <#${newMessage.channel.id}>:\n**Before:** ${oldMessage.content || '*unknown*'}\n**After:** ${newMessage.content}`
   );
 });
 
-// ─── Welcome DM ───────────────────────────────────────────────────────────────
+// ─── Welcome DM on join ───────────────────────────────────────────────────────
 client.on('guildMemberAdd', async (member) => {
-  const { guildData } = getGuildData(member.guild.id);
-  if (!guildData.welcomeDm) return;
+  const { guildData: gd } = getGuildData(member.guild.id);
+  if (!gd.welcomeDm) return;
 
+  const replace = (str) => str
+    ? str.replace(/{user}/g, member.user.username).replace(/{server}/g, member.guild.name)
+    : '';
+
+  if (gd.welcomeFormat === 'embed' && gd.welcomeEmbed) {
+    const we = gd.welcomeEmbed;
+    const e  = new EmbedBuilder().setTimestamp();
+    if (we.title)  e.setTitle(replace(we.title));
+    if (we.author) e.setAuthor({ name: replace(we.author) });
+    if (we.body)   e.setDescription(replace(we.body));
+    if (we.footer) e.setFooter({ text: replace(we.footer) });
+    if (we.color)  { try { e.setColor(we.color); } catch {} }
+    try { await member.send({ embeds: [e] }); } catch {}
+    return;
+  }
+
+  if (gd.welcomeFormat === 'message' && gd.welcomeMsg) {
+    const wm   = gd.welcomeMsg;
+    const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    let content = '';
+    if (wm.title) content += `**${replace(wm.title)}**\n`;
+    content += replace(wm.body);
+    if (wm.timestamp) content += `\n\n*sent on ${date}*`;
+    try { await member.send(content); } catch {}
+    return;
+  }
+
+  // Default welcome DM
   const msg = [
-    `\`\`\``,
+    '```',
     `.      *     +      w e l c o m e`,
     `            ${member.user.username}                          to`,
     `                    ${member.guild.name}`,
     ``,
     `.      *     +      p a r t n e r s`,
-    `            c l i c k     [ h e r e ](https://ke.xo.je)`,
+    `            c l i c k     h e r e  →  https://ke.xo.je`,
     `               t o       s e e      t h e m`,
     ``,
     `.      *     +      c r e d i t s`,
-    `            b o t    m a d e     b y  `,
-    `                   >>   @ a f k n e o `,
+    `            b o t    m a d e     b y`,
+    `                   >>   @ a f k n e o`,
     `                    o n                   d i s c o r d`,
     `                   <>`,
     `               m a d e       o n            a p r.    8.    2026`,
-    `\`\`\``,
+    '```',
   ].join('\n');
-
   try { await member.send(msg); } catch {}
 });
 
