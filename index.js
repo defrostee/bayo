@@ -390,6 +390,22 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isModalSubmit()) {
     const guildId = interaction.guild.id;
 
+    if (interaction.customId === 'avatar_url_modal') {
+      const { guildData: gd } = getGuildData(interaction.guild.id);
+      if (!hasBotRole(interaction.member, gd)) {
+        await interaction.reply({ embeds: [err("you don't have the role for that.")], ephemeral: true });
+        return;
+      }
+      const url = interaction.fields.getTextInputValue('avatar_url');
+      try {
+        await client.user.setAvatar(url);
+        await interaction.reply({ embeds: [ok('Avatar updated. stunning.')], ephemeral: true });
+      } catch (e) {
+        await interaction.reply({ embeds: [err(`Failed: ${e.message}`)], ephemeral: true });
+      }
+      return;
+    }
+
     if (interaction.customId === 'wmset_message') {
       const title     = interaction.fields.getTextInputValue('wm_title');
       const body      = interaction.fields.getTextInputValue('wm_body');
@@ -411,8 +427,30 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // Button presses (from +wmset prefix command)
+  // Button presses
   if (interaction.isButton()) {
+    // Avatar URL button
+    if (interaction.customId === 'avatar_url_open') {
+      const { guildData: gd } = getGuildData(interaction.guild.id);
+      if (!hasBotRole(interaction.member, gd)) {
+        await interaction.reply({ embeds: [err("you don't have the role for that.")], ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder().setCustomId('avatar_url_modal').setTitle('Change Bot Avatar');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('avatar_url')
+            .setLabel('Discord image URL (cdn.discordapp.com)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('https://cdn.discordapp.com/attachments/...')
+        )
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
     if (!interaction.customId.startsWith('wmset_open_')) return;
     if (!isOwner(interaction.member)) {
       await interaction.reply({ embeds: [err('owners only.')], ephemeral: true });
@@ -487,9 +525,11 @@ client.on('messageCreate', async (message) => {
         return handleModrole(message.member, role, reply);
       }
       case 'avatar': {
-        const att = message.attachments.first();
-        if (!att) return reply({ embeds: [err('attach an image.')] });
-        return handleAvatar(message.member, gd, att.url, reply);
+        if (!hasBotRole(message.member, gd)) return reply({ embeds: [err("you don't have the role for that.")] });
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('avatar_url_open').setLabel('Change Avatar via URL').setStyle(ButtonStyle.Primary)
+        );
+        return reply({ embeds: [info('Click below to enter a Discord image URL for the new avatar.')], components: [row] });
       }
       case 'nickname': {
         const nick = args.join(' ');
